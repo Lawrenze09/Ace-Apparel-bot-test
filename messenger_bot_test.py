@@ -3,12 +3,20 @@
 Architecture (strict processing order per incoming message):
   1. HMAC-SHA256 signature check         — rejects unsigned/forged payloads
   2. Echo filter                         — breaks admin-reply infinite loop
-  3. Message deduplication (deque/100)   — drops Facebook retry spam
+  3. Message deduplication (Redis SETNX) — drops Facebook retry spam
   4. Bot paused guard                    — silent while admin has thread
-  5. First-time greeting + carousel      — rule-based, fires exactly once per user
-  6. Admin handover keywords             — SMTP alert + per-user pause
+  5. Admin handover keywords             — SMTP alert + per-user pause (first)
+  6. First-time greeting + carousel      — rule-based, fires exactly once per user
   7. Product keyword / price search      — pure rule-based, JSON = source of truth
   8. Gemini conversational fallback      — only fires when rules don't match
+
+Session Storage:
+  - Primary : Redis (Upstash) — persists across Render restarts/rebuilds
+  - Fallback : In-memory dict — used if REDIS_URL is not set (local dev)
+
+Deduplication:
+  - Primary : Redis SETNX with 5-min TTL — atomic, cross-worker safe
+  - Fallback : In-memory deque(100) — used if REDIS_URL is not set
 
 Data contract (products.json):
   - keywords    : list[str]   — all lowercase, no currency symbols
@@ -31,15 +39,16 @@ import re
 import smtplib
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from queue import Full, Queue
-from threading import Lock
-from threading import Thread
-from typing import Optional
+from threading import Lock, Thread
+from typing import Any, Optional
 
 import google.generativeai as genai
+import redis as redis_lib
 import requests
 from apscheduler.schedulers.background import BackgroundScheduler
 from flask import Flask, abort, jsonify, request
@@ -59,19 +68,7 @@ logger = logging.getLogger(__name__)
 
 
 def _read_secret(filename: str, env_key: str) -> Optional[str]:
-    """Read a secret from a Render Secret File, falling back to an env var.
-
-    Render mounts Secret Files at ``/etc/secrets/<filename>``. These never
-    appear in process listings or env dumps — the right place for the most
-    sensitive tokens (App Secret, Page Access Token).
-
-    Args:
-        filename: Basename of the file under ``/etc/secrets/``.
-        env_key:  Env var name used as a local-dev fallback.
-
-    Returns:
-        The secret value, or ``None`` if neither source has it.
-    """
+    """Read a secret from a Render Secret File, falling back to an env var."""
     try:
         with open(f"/etc/secrets/{filename}") as f:
             value = f.read().strip()
@@ -93,6 +90,7 @@ SENDER_PASSWORD     = os.environ.get("SENDER_PASSWORD")
 RECEIVER_EMAIL      = os.environ.get("RECEIVER_EMAIL")
 GITHUB_PRODUCTS_URL = os.environ.get("GITHUB_PRODUCTS_URL")
 HEALTH_TOKEN        = os.environ.get("HEALTH_TOKEN")
+REDIS_URL           = os.environ.get("REDIS_URL")  # e.g. redis://default:password@host:port
 
 # ── Service config ───────────────────────────────────────────────────────────
 GRAPH_API_VERSION  = "v22.0"
@@ -109,8 +107,11 @@ MAX_PAYLOAD_CHARS = 1_000
 EMAIL_RATE_LIMIT  = 2    # max admin emails per user
 EMAIL_WINDOW_SECS = 300  # within this window (seconds)
 
-# GITHUB_PRODUCTS_URL validated at startup — prevents SSRF if the env var
-# is accidentally pointed at an internal service.
+# ── Dedup TTL ────────────────────────────────────────────────────────────────
+DEDUP_TTL_SECS   = 300                # how long to remember a message ID in Redis
+SESSION_TTL_SECS = 60 * 60 * 24 * 90  # expire inactive sessions after 90 days
+
+# GITHUB_PRODUCTS_URL validated at startup — prevents SSRF.
 _GITHUB_RAW_PATTERN = re.compile(
     r"^https://raw\.githubusercontent\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/"
 )
@@ -120,7 +121,6 @@ _PRICE_RE = re.compile(
     r"\b(below|under|less than|above|over|more than)\s+(\d+(?:\.\d+)?)\b"
 )
 
-# Sofia's Gemini system instruction — tells the LLM what it can and cannot do.
 _GEMINI_SYSTEM_INSTRUCTION = """\
 You are Sofia, an AI customer assistant for Ace Apparel — a Filipino streetwear brand.
 
@@ -140,35 +140,18 @@ HANDOVER_KEYWORDS = frozenset({
     "problema", "issue", "reklamo", "balik", "return", "problem", "cancel",
 })
 
-# Greeting words intercepted AFTER first-time greeting has already fired.
-# Prevents Gemini from re-greeting a user who was already welcomed via
-# Get Started button or a previous first message.
 _GREETING_KEYWORDS = frozenset({
     "hi", "hello", "hey", "kumusta", "kamusta", "musta", "good morning",
     "good afternoon", "good evening", "magandang umaga", "magandang hapon",
     "magandang gabi", "sup", "yo",
 })
 
-# Flask app
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 1 * 1024 * 1024  # 1 MB hard cap
 
 
 def _verify_signature(raw_body: bytes, header: str) -> bool:
-    """Validate the X-Hub-Signature-256 header on every incoming webhook POST.
-
-    Facebook signs every delivery with HMAC-SHA256(app_secret, raw_body).
-    Using ``hmac.compare_digest`` prevents timing-oracle attacks — an attacker
-    cannot brute-force the App Secret one byte at a time by measuring how long
-    a rejected comparison takes.
-
-    Args:
-        raw_body: Raw request bytes, read before Flask parses JSON.
-        header:   Value of the ``X-Hub-Signature-256`` request header.
-
-    Returns:
-        ``True`` if the digest matches, ``False`` otherwise.
-    """
+    """Validate X-Hub-Signature-256 using constant-time comparison."""
     if not FB_APP_SECRET:
         logger.error("FB_APP_SECRET not set — rejecting all webhook traffic.")
         return False
@@ -179,37 +162,43 @@ def _verify_signature(raw_body: bytes, header: str) -> bool:
 
 
 # ============================================================================
-# SECTION 2 — Memory & Deduplication
+# SECTION 2 — Redis Client + Session & Deduplication
 # ============================================================================
 
-# deque(maxlen=100) — O(1) append, O(n) lookup. Fine at this message volume.
-# At production scale, swap for a Redis SET with TTL.
+# Redis client — set in _startup(). None means Redis unavailable → use fallback.
+_redis: Optional[Any] = None  # redis_lib.Redis instance when connected
+
+# ── In-memory fallbacks (used when REDIS_URL is not set e.g. local dev) ──────
 _seen_message_ids: deque[str] = deque(maxlen=100)
+_user_sessions:   dict[str, dict] = {}
 
-# Per-user session state keyed by PSID.
-# Schema: {"greeted": bool, "paused": bool, "email_ts": list[float]}
-_user_sessions: dict[str, dict] = {}
-
-# One lock protects both shared structures above.
+# One lock for all in-memory state mutations (threads share memory).
+# Also used to serialise Redis session reads+writes within this process.
 _state_lock = Lock()
 
-# Webhook processing queue. Prevents spawning unbounded threads when Meta retries
-# deliveries during cold starts or transient slowdowns.
+# Webhook processing queue
 _event_queue: "Queue[dict]" = Queue(maxsize=int(os.environ.get("WEBHOOK_QUEUE_MAX", "200")))
+_event_pool:  Optional[ThreadPoolExecutor] = None
 
+
+# ── Deduplication ─────────────────────────────────────────────────────────────
 
 def _is_duplicate(mid: str) -> bool:
-    """Return True if this message ID has already been processed.
+    """Return True if this message/postback ID was already processed.
 
-    Facebook retries webhook delivery when it doesn't receive a timely 200.
-    Without dedup a slow downstream call causes the same message to fire twice.
-
-    Args:
-        mid: The ``mid`` field from the Messenger event.
-
-    Returns:
-        ``True`` if already seen, ``False`` (and registers the ID) otherwise.
+    Redis path  : SETNX with TTL — atomic, survives restarts, cross-worker safe.
+    Fallback    : in-memory deque — used when REDIS_URL is not configured.
     """
+    if _redis is not None:
+        try:
+            # SET NX EX: set the key only if it does NOT exist, expire after TTL.
+            # Returns True if key was set (new), None if key already existed (dup).
+            added = _redis.set(f"seen:{mid}", "1", nx=True, ex=DEDUP_TTL_SECS)
+            return added is None
+        except Exception as exc:
+            logger.error("Redis dedup error (falling back to in-memory): %s", exc)
+
+    # In-memory fallback
     with _state_lock:
         if mid in _seen_message_ids:
             return True
@@ -217,15 +206,33 @@ def _is_duplicate(mid: str) -> bool:
         return False
 
 
+# ── Session helpers ───────────────────────────────────────────────────────────
+
+def _session_key(psid: str) -> str:
+    return f"session:{psid}"
+
+
 def _get_session(psid: str) -> dict:
-    """Return the mutable session dict for a user, creating it on first access.
+    """Fetch session dict from Redis or in-memory fallback.
 
-    Caller must hold ``_state_lock`` if mutating the returned dict outside
-    of the dedicated helper methods below.
-
-    Args:
-        psid: Facebook Page-Scoped User ID.
+    Always returns a complete dict with all expected keys.
+    Caller must hold _state_lock if modifying the returned dict
+    and then calling _save_session().
     """
+    if _redis is not None:
+        try:
+            raw = _redis.get(_session_key(psid))
+            if raw:
+                data = json.loads(raw)
+                # Ensure all keys exist (safe for sessions created by older versions)
+                data.setdefault("greeted",  False)
+                data.setdefault("paused",   False)
+                data.setdefault("email_ts", [])
+                return data
+        except Exception as exc:
+            logger.error("Redis get_session error: %s", exc)
+
+    # In-memory fallback
     return _user_sessions.setdefault(psid, {
         "greeted":  False,
         "paused":   False,
@@ -233,77 +240,76 @@ def _get_session(psid: str) -> dict:
     })
 
 
+def _save_session(psid: str, session: dict) -> None:
+    """Persist a session dict to Redis or in-memory fallback."""
+    if _redis is not None:
+        try:
+            # ex=SESSION_TTL_SECS resets the 90-day clock on every interaction.
+            # Inactive users expire automatically; active users never lose their session.
+            _redis.set(_session_key(psid), json.dumps(session), ex=SESSION_TTL_SECS)
+            return
+        except Exception as exc:
+            logger.error("Redis save_session error: %s", exc)
+
+    # In-memory fallback
+    _user_sessions[psid] = session
+
+
 def _is_first_time(psid: str) -> bool:
-    """Atomically check-and-mark whether this is a user's first message.
+    """Atomically check-and-mark whether this is a user's first interaction.
 
-    The check and the write happen inside a single lock acquisition — no race
-    window even if two events for the same PSID arrive concurrently.
-
-    Args:
-        psid: Facebook Page-Scoped User ID.
-
-    Returns:
-        ``True`` exactly once per user; ``False`` on every subsequent call.
+    Returns True exactly once per user, then False on every subsequent call.
+    Thread-safe via _state_lock; Redis provides cross-restart persistence.
     """
     with _state_lock:
         session = _get_session(psid)
         if session["greeted"]:
             return False
         session["greeted"] = True
+        _save_session(psid, session)
         return True
 
 
 def _mark_greeted(psid: str) -> None:
     """Mark a user as greeted without sending the greeting.
 
-    Used when a first-ever message triggers a non-greeting terminal path
+    Used when a first-ever message triggers a non-greeting path
     (e.g., admin handover) so the user doesn't get a welcome message later.
     """
     with _state_lock:
-        _get_session(psid)["greeted"] = True
+        session = _get_session(psid)
+        session["greeted"] = True
+        _save_session(psid, session)
 
 
 def _is_paused(psid: str) -> bool:
-    """Return True if the bot is paused for this user (admin has the thread).
-
-    Args:
-        psid: Facebook Page-Scoped User ID.
-    """
+    """Return True if the bot is paused for this user (admin has the thread)."""
     with _state_lock:
         return _get_session(psid).get("paused", False)
 
 
 def _set_paused(psid: str, paused: bool) -> None:
-    """Set the pause state for a user's thread.
-
-    Args:
-        psid:   Facebook Page-Scoped User ID.
-        paused: ``True`` to pause (admin active), ``False`` to resume (bot active).
-    """
+    """Set the pause state for a user's thread."""
     with _state_lock:
-        _get_session(psid)["paused"] = paused
+        session = _get_session(psid)
+        session["paused"] = paused
+        _save_session(psid, session)
 
 
 def _allow_email(psid: str) -> bool:
     """Sliding-window rate check for admin email alerts.
 
-    A spoofed webhook flood would otherwise spam the admin inbox and trigger
-    Google's abuse filters, permanently disabling the sender account.
-
-    Args:
-        psid: Facebook Page-Scoped User ID.
-
-    Returns:
-        ``True`` if within quota, ``False`` if throttled.
+    Timestamps are stored inside the session dict so they persist in Redis.
     """
     with _state_lock:
-        session   = _get_session(psid)
-        now       = time.time()
-        recent    = [t for t in session["email_ts"] if t > now - EMAIL_WINDOW_SECS]
+        session = _get_session(psid)
+        now     = time.time()
+        recent  = [t for t in session.get("email_ts", []) if t > now - EMAIL_WINDOW_SECS]
         if len(recent) >= EMAIL_RATE_LIMIT:
             return False
         recent.append(now)
         session["email_ts"] = recent
+        _save_session(psid, session)
         return True
 
 
@@ -315,7 +321,6 @@ _products_cache:   list[dict]        = []
 _cache_updated_at: Optional[datetime] = None
 _cache_lock        = Lock()
 
-# First-time carousel composition: category → count (must sum to ≤ 10).
 _DEFAULT_CAROUSEL_SPEC: list[tuple[str, int]] = [
     ("oversized_tee", 4),
     ("mesh_short",    3),
@@ -326,14 +331,6 @@ _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 
 def _sanitize_product(p: dict) -> dict:
-    """Strip control characters from string fields to protect downstream payloads.
-
-    Args:
-        p: Raw product dict from the JSON feed.
-
-    Returns:
-        Cleaned copy with string values capped at 500 chars.
-    """
     return {
         k: _CONTROL_RE.sub("", str(v))[:500] if isinstance(v, str) else v
         for k, v in p.items()
@@ -341,12 +338,6 @@ def _sanitize_product(p: dict) -> dict:
 
 
 def _refresh_cache() -> None:
-    """Fetch products.json from GitHub and replace the in-memory cache.
-
-    Called once at startup and then every CACHE_REFRESH_MINS by APScheduler.
-    Logs the error and returns silently on failure — the scheduler must keep
-    running even when GitHub is unreachable.
-    """
     global _products_cache, _cache_updated_at
     try:
         resp = requests.get(GITHUB_PRODUCTS_URL, timeout=10)
@@ -367,53 +358,19 @@ def _refresh_cache() -> None:
 
 
 def _get_products() -> list[dict]:
-    """Return a safe snapshot of the product cache for iteration.
-
-    Returns:
-        Shallow copy — safe to use outside the lock.
-    """
     with _cache_lock:
         return _products_cache.copy()
 
 
 def _parse_price_condition(text: str) -> Optional[tuple[str, float]]:
-    """Extract a price-filter condition from free text.
-
-    Examples:
-        "mesh short below 500"    → ("below", 500.0)
-        "hoodies above 300"       → ("above", 300.0)
-        "oversized tee less than 450" → ("less than", 450.0)
-
-    Args:
-        text: Normalised (lowercased) customer message.
-
-    Returns:
-        ``(operator, amount)`` tuple, or ``None`` if no price condition found.
-    """
     m = _PRICE_RE.search(text)
     if not m:
         return None
     return m.group(1), float(m.group(2))
 
 
-def _apply_price_filter(
-    products: list[dict], operator: str, amount: float
-) -> list[dict]:
-    """Filter products by a numeric price threshold.
-
-    Prices in products.json are stored as integers/floats (no ₱ symbol) —
-    this makes comparison trivial with no string-parsing hacks.
-
-    Args:
-        products: Product list to filter.
-        operator: One of "below" / "under" / "less than" / "above" / "over"
-                  / "more than".
-        amount:   Numeric price threshold.
-
-    Returns:
-        Filtered list.
-    """
-    lower = operator in ("below", "under", "less than")
+def _apply_price_filter(products: list[dict], operator: str, amount: float) -> list[dict]:
+    lower  = operator in ("below", "under", "less than")
     result = []
     for p in products:
         try:
@@ -428,7 +385,6 @@ def _apply_price_filter(
 
 
 def _stock_label(availability: str) -> str:
-    """Map products.json availability string to a display label."""
     labels = {
         "In Stock":        "Available",
         "Limited Edition": "Limited Ed.",
@@ -439,32 +395,9 @@ def _stock_label(availability: str) -> str:
 
 
 def _search_products(text: str) -> list[dict]:
-    """Match a customer message against the product catalogue.
-
-    Three-pass strategy:
-
-    Pass 1 — Direct SKU / name containment.
-        Checks if a product ID or name appears *within* the message (not
-        equality). "Magkano ang ACE-OVT-001" → matches ACE-OVT-001.
-
-    Pass 2 — Keyword overlap.
-        Checks lowercase keywords array. All keywords in products.json must
-        be lowercase (data contract). Collects up to 10 hits.
-
-    Pass 3 — Optional price filter.
-        Applied on top of keyword results if the message contains a price
-        condition (e.g. "mesh shorts below 500").
-
-    Args:
-        text: Normalised (lowercased, stripped) customer message.
-
-    Returns:
-        List of matching product dicts, capped at 10 (FB carousel limit).
-    """
     products   = _get_products()
     price_cond = _parse_price_condition(text)
 
-    # Pass 1 — SKU or name contained anywhere in the message.
     for p in products:
         pid   = str(p.get("id", "")).lower()
         pname = str(p.get("name", "")).lower()
@@ -472,7 +405,6 @@ def _search_products(text: str) -> list[dict]:
             logger.info("Direct match: %s", p.get("id"))
             return [p]
 
-    # Pass 2 — keyword overlap.
     seen: set[str] = set()
     hits: list[dict] = []
     for p in products:
@@ -481,7 +413,6 @@ def _search_products(text: str) -> list[dict]:
             seen.add(p["id"])
             hits.append(p)
 
-    # Pass 3 — optional price filter on top of keyword results.
     if price_cond and hits:
         hits = _apply_price_filter(hits, price_cond[0], price_cond[1])
 
@@ -490,14 +421,6 @@ def _search_products(text: str) -> list[dict]:
 
 
 def _build_default_carousel() -> list[dict]:
-    """Select products for the first-time welcome carousel.
-
-    Pulls 4 oversized tees, 3 mesh shorts, and 3 hoodies by the ``category``
-    field. Falls back gracefully if a category has fewer items than requested.
-
-    Returns:
-        Ordered list of up to 10 product dicts.
-    """
     products = _get_products()
     result: list[dict] = []
     for category, count in _DEFAULT_CAROUSEL_SPEC:
@@ -510,16 +433,7 @@ def _build_default_carousel() -> list[dict]:
 # SECTION 4 — Meta API Handlers
 # ============================================================================
 
-
 def _get_user_profile(psid: str) -> dict:
-    """Fetch first and last name from the Graph API.
-
-    Args:
-        psid: Facebook Page-Scoped User ID.
-
-    Returns:
-        Profile dict. Falls back to ``{"first_name": "Customer"}`` on any error.
-    """
     try:
         resp = requests.get(
             f"https://graph.facebook.com/{GRAPH_API_VERSION}/{psid}",
@@ -534,18 +448,6 @@ def _get_user_profile(psid: str) -> dict:
 
 
 def _post_to_messenger(psid: str, message_data: dict) -> bool:
-    """Internal POST to the Messenger Send API.
-
-    ``messaging_type="RESPONSE"`` is required for Generic Templates on Graph
-    API v12+. Plain text has a legacy fallback; templates silently fail without it.
-
-    Args:
-        psid:         Recipient's PSID.
-        message_data: Messenger message object (text or attachment).
-
-    Returns:
-        ``True`` on success, ``False`` on any API or network error.
-    """
     raw = None
     try:
         raw = requests.post(
@@ -576,31 +478,10 @@ def _post_to_messenger(psid: str, message_data: dict) -> bool:
 
 
 def send_text(psid: str, text: str) -> bool:
-    """Send a plain-text message to a Messenger user.
-
-    Args:
-        psid: Recipient's Facebook Page-Scoped User ID.
-        text: Message body.
-
-    Returns:
-        ``True`` on success.
-    """
     return _post_to_messenger(psid, {"text": text})
 
 
 def send_carousel(psid: str, products: list[dict]) -> bool:
-    """Send a Facebook Generic Template carousel.
-
-    Prices are formatted from the integer in products.json back into a
-    ₱-prefixed display string. All fields come directly from the JSON.
-
-    Args:
-        psid:     Recipient's Facebook Page-Scoped User ID.
-        products: Product dicts (max 10; extras silently dropped).
-
-    Returns:
-        ``True`` on success.
-    """
     if not products:
         return send_text(psid, "Naku, pasensya na po... hindi ko po mahanap yan sa catalog namin.")
 
@@ -635,12 +516,6 @@ def send_carousel(psid: str, products: list[dict]) -> bool:
 
 
 def _send_typing(psid: str, on: bool = True) -> None:
-    """Toggle the typing bubble for a conversation.
-
-    Args:
-        psid: Recipient's Facebook Page-Scoped User ID.
-        on:   ``True`` to show, ``False`` to hide.
-    """
     try:
         requests.post(
             f"https://graph.facebook.com/{GRAPH_API_VERSION}/me/messages",
@@ -656,16 +531,6 @@ def _send_typing(psid: str, on: bool = True) -> None:
 
 
 def _send_product_detail(psid: str, product: dict, first_name: str) -> None:
-    """Send a single-product image card followed by a plain-text detail block.
-
-    All data — name, price, availability, description — comes from the JSON.
-    Nothing is inferred or generated by the LLM.
-
-    Args:
-        psid:       Recipient's Facebook Page-Scoped User ID.
-        product:    The matched product dict.
-        first_name: Customer's first name.
-    """
     send_carousel(psid, [product])
     try:
         raw_price     = str(product.get("price", 0)).replace("₱", "").replace(",", "").strip()
@@ -684,22 +549,8 @@ def _send_product_detail(psid: str, product: dict, first_name: str) -> None:
 
 
 def _notify_admin(psid: str, message: str, profile: dict) -> bool:
-    """Send a Gmail handover alert via smtplib.
-
-    Rate-limited to prevent inbox spam from spoofed webhook floods.
-
-    Args:
-        psid:    Sender's PSID.
-        message: Message that triggered the handover.
-        profile: User profile dict (first_name / last_name).
-
-    Returns:
-        ``True`` if the email was sent.
-    """
     if not (SENDER_EMAIL and SENDER_PASSWORD and RECEIVER_EMAIL):
-        logger.warning(
-            "Admin email not configured (missing SENDER_EMAIL/SENDER_PASSWORD/RECEIVER_EMAIL)."
-        )
+        logger.warning("Admin email not configured — handover email skipped.")
         return False
     if not _allow_email(psid):
         logger.warning("Email rate-limited for %s — suppressed.", psid[:20])
@@ -737,14 +588,8 @@ def _notify_admin(psid: str, message: str, profile: dict) -> bool:
 # SECTION 5 — Hybrid Routing Engine
 # ============================================================================
 
-
 def _send_first_time_greeting(psid: str) -> None:
-    """Send the welcome message + default carousel.
-
-    Shared by both _handle_message (first text) and _handle_postback
-    (Get Started button). Always call _is_first_time(psid) before this —
-    this function does not check it itself.
-    """
+    """Send the welcome message + default carousel. Call _is_first_time() before this."""
     profile    = _get_user_profile(psid)
     first_name = profile.get("first_name", "Customer")
     send_text(psid, (
@@ -760,30 +605,24 @@ def _send_first_time_greeting(psid: str) -> None:
 
 
 def _handle_message(psid: str, raw_text: str) -> None:
-    """Route one incoming customer message through the hybrid engine.
+    """Route one incoming message through the hybrid engine.
 
     Processing order (strict — do not reorder):
-      1. First-time greeting + default carousel  (rule-based, fires once per user)
-      2. Admin handover keywords                 (rule-based, pause this thread)
-      3. Catalog browse trigger                  (rule-based, explicit browse intent)
-      4. Greeting intercept                      (prevents Gemini re-greeting)
-      5. Product SKU / keyword / price search    (rule-based, JSON = source of truth)
-      6. Gemini conversational fallback          (LLM, only when 1-5 don't apply)
-
-    Args:
-        psid:     Sender's Facebook Page-Scoped User ID.
-        raw_text: Unmodified message text from the Messenger event.
+      1. Admin handover    — fires even on first-ever message
+      2. First-time greeting + carousel
+      3. Catalog browse trigger
+      4. Greeting intercept
+      5. Product keyword / SKU / price search
+      6. Gemini conversational fallback
     """
     _send_typing(psid, True)
 
     try:
         profile    = _get_user_profile(psid)
         first_name = profile.get("first_name", "Customer")
+        text       = raw_text[:MAX_INPUT_CHARS].strip().lower()
 
-        # Normalise once here — all rule checks below use this.
-        text = raw_text[:MAX_INPUT_CHARS].strip().lower()
-
-        # ── Step 1: Admin handover (must work even on a first-ever message) ──
+        # ── Step 1: Admin handover ────────────────────────────────────────────
         if any(kw in text for kw in HANDOVER_KEYWORDS):
             send_text(psid, (
                 "We are really sorry for the inconvenience po.\n"
@@ -794,12 +633,12 @@ def _handle_message(psid: str, raw_text: str) -> None:
             _set_paused(psid, True)
             return
 
-        # ── Step 2: First-time greeting + default carousel ───────────────────
+        # ── Step 2: First-time greeting ───────────────────────────────────────
         if _is_first_time(psid):
             _send_first_time_greeting(psid)
             return
 
-        # ── Step 3: Explicit catalog browse trigger ───────────────────────────
+        # ── Step 3: Catalog browse trigger ────────────────────────────────────
         if any(kw in text for kw in ("products", "product", "catalog", "catalogue", "browse", "listahan")):
             default_products = _build_default_carousel()
             if default_products:
@@ -810,10 +649,6 @@ def _handle_message(psid: str, raw_text: str) -> None:
             return
 
         # ── Step 4: Greeting intercept ────────────────────────────────────────
-        # If the user says "hi/hello" AFTER the first-time greeting has already
-        # fired (e.g. they clicked Get Started, then typed "hi"), respond with
-        # a short acknowledgement + catalog instead of routing to Gemini, which
-        # would produce a second full greeting and confuse the customer.
         if text in _GREETING_KEYWORDS or any(text.startswith(kw) for kw in _GREETING_KEYWORDS):
             send_text(psid, f"Nandito pa po ako, {first_name}! Paano kita matutulungan?")
             default_products = _build_default_carousel()
@@ -822,23 +657,19 @@ def _handle_message(psid: str, raw_text: str) -> None:
                 send_carousel(psid, default_products)
             return
 
-        # ── Step 5: Product keyword / SKU / price search ─────────────────────
+        # ── Step 5: Product search ────────────────────────────────────────────
         matches = _search_products(text)
         if matches:
             if len(matches) == 1:
-                # Direct hit — show image card + exact price from JSON, no LLM.
                 _send_product_detail(psid, matches[0], first_name)
             else:
                 send_text(psid, (
-                    f"Nahanap ko po ang {len(matches)} product(s) para sa inyo, "
-                    f"{first_name}!"
+                    f"Nahanap ko po ang {len(matches)} product(s) para sa inyo, {first_name}!"
                 ))
                 send_carousel(psid, matches)
             return
 
-        # ── Step 6: Gemini conversational fallback ────────────────────────────
-        # Only reaches here if no rule matched — sizing questions, shipping
-        # queries, general brand conversation.
+        # ── Step 6: Gemini fallback ───────────────────────────────────────────
         send_text(psid, _get_gemini_reply(raw_text, first_name))
 
     except Exception:
@@ -849,26 +680,17 @@ def _handle_message(psid: str, raw_text: str) -> None:
 
 
 def _get_gemini_reply(user_message: str, first_name: str) -> str:
-    """Generate a Gemini response for messages that didn't match any rule.
-
-    Gemini handles conversational queries — sizing, shipping, etc.
-    The system instruction explicitly forbids it from stating prices or inventing
-    product details; all product data must come from the rule engine.
-
-    Args:
-        user_message: Raw customer message text.
-        first_name:   Customer's first name for the prompt.
-
-    Returns:
-        AI-generated reply string, or a safe Taglish fallback on error.
-    """
     try:
         model  = genai.GenerativeModel(
             model_name=GEMINI_MODEL,
             system_instruction=_GEMINI_SYSTEM_INSTRUCTION,
         )
         prompt = f"Customer ({first_name}): {user_message}\nSofia:"
-        return model.generate_content(prompt).text.strip()
+        resp   = model.generate_content(
+            prompt,
+            request_options={"timeout": int(os.environ.get("GEMINI_TIMEOUT_SECS", "12"))},
+        )
+        return (resp.text or "").strip()
     except Exception as exc:
         logger.error("Gemini error: %s", exc)
         return (
@@ -878,18 +700,7 @@ def _get_gemini_reply(user_message: str, first_name: str) -> str:
 
 
 def _handle_admin_echo(event: dict) -> None:
-    """Process echo events fired when the Page sends a message from Inbox.
-
-    In an echo event ``sender.id`` is the Page ID, so state is tracked by
-    ``recipient.id`` (the customer PSID). This handler must be called before
-    ``_handle_message`` — without this intercept, the bot's own outgoing
-    messages loop back as echo events and re-enter the pipeline infinitely.
-
-    'bot' or 'sofia' typed by the admin resumes Sofia and confirms to the customer.
-
-    Args:
-        event: Raw messaging event dict from the webhook payload.
-    """
+    """Handle echo events from admin messages in the Page inbox."""
     psid = event.get("recipient", {}).get("id")
     text = event.get("message", {}).get("text", "")
 
@@ -902,21 +713,12 @@ def _handle_admin_echo(event: dict) -> None:
         send_text(psid, "Bumalik na po ako! Paano ko pa po kayo matutulungan?")
         logger.info("Bot resumed for user %s.", psid[:20])
     else:
-        # Any other admin message keeps the thread paused.
         _set_paused(psid, True)
         logger.info("Admin replied to %s — bot remains paused.", psid[:20])
 
 
 def _handle_postback(psid: str, raw_payload: str) -> None:
-    """Route a postback event from a carousel button or the Get Started button.
-
-    GET_STARTED is a plain string — json.loads() raises JSONDecodeError for it,
-    so it is handled in the except block. All carousel button payloads are JSON.
-
-    Args:
-        psid:        Sender's Facebook Page-Scoped User ID.
-        raw_payload: Raw payload string from the postback event.
-    """
+    """Route postback events from carousel buttons and the Get Started button."""
     raw_payload = raw_payload[:MAX_PAYLOAD_CHARS]
 
     try:
@@ -933,21 +735,15 @@ def _handle_postback(psid: str, raw_payload: str) -> None:
             if product:
                 _send_product_detail(psid, product, first_name)
             else:
-                send_text(
-                    psid,
-                    f"Sorry po {first_name}, hindi ko mahanap ang product na 'yan.",
-                )
+                send_text(psid, f"Sorry po {first_name}, hindi ko mahanap ang product na 'yan.")
         else:
             logger.warning("Unknown postback action: %s", data.get("action"))
 
     except json.JSONDecodeError:
-        # GET_STARTED is a plain string — not valid JSON. Handle it here.
         if raw_payload.strip().upper() == "GET_STARTED":
             if _is_first_time(psid):
-                # First ever interaction — send full welcome greeting + carousel.
                 _send_first_time_greeting(psid)
             else:
-                # Already greeted (user opened chat before) — show catalog only.
                 profile    = _get_user_profile(psid)
                 first_name = profile.get("first_name", "Customer")
                 send_text(psid, f"Nandito pa po ako, {first_name}! Paano kita matutulungan?")
@@ -965,14 +761,8 @@ def _handle_postback(psid: str, raw_payload: str) -> None:
 # SECTION 6 — Flask Routes
 # ============================================================================
 
-
 @app.route("/webhook", methods=["GET"])
 def verify_webhook():
-    """Handle the one-time Meta webhook verification handshake.
-
-    Returns:
-        The ``hub.challenge`` value with HTTP 200 on success, 403 on mismatch.
-    """
     if (
         request.args.get("hub.mode") == "subscribe"
         and request.args.get("hub.verify_token") == VERIFY_TOKEN
@@ -985,22 +775,7 @@ def verify_webhook():
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    """Receive and route all incoming Messenger events.
-
-    Security gates (in order):
-      1. HMAC-SHA256 — rejects anything not signed by Facebook.
-      2. object == 'page' — ignores non-page subscriptions.
-      3. is_echo intercept — admin outgoing messages go to _handle_admin_echo(),
-         never to _handle_message(). This breaks the infinite-loop.
-      4. Deduplication — drops Facebook retry deliveries.
-      5. Paused guard — drops customer messages while admin has the thread.
-
-    Always returns 200 to Facebook for valid signed payloads. Non-200 causes
-    Facebook to retry delivery, which amplifies any loop problem.
-
-    Returns:
-        ``"OK"`` with HTTP 200 on success.
-    """
+    """Receive Messenger events. Returns 200 immediately; processing is async."""
     raw_body = request.get_data()
     if not _verify_signature(raw_body, request.headers.get("X-Hub-Signature-256", "")):
         logger.warning("Rejected POST — bad signature from %s.", request.remote_addr)
@@ -1014,13 +789,6 @@ def webhook():
     if data.get("object") != "page":
         return "OK", 200
 
-    # IMPORTANT (Render cold starts):
-    # Return HTTP 200 to Meta as fast as possible. If we block here on network
-    # calls (Graph API, SMTP, Gemini), Meta retries delivery and you see
-    # duplicate greetings / repeated actions.
-    #
-    # We enqueue the payload for a single background worker instead of spawning
-    # a thread per request (which can spike memory and get the worker SIGKILL'ed).
     try:
         _event_queue.put_nowait(data)
     except Full:
@@ -1030,15 +798,6 @@ def webhook():
 
 @app.route("/health", methods=["GET"])
 def health_check():
-    """Return bot health metrics to authorised callers.
-
-    Requires ``Authorization: Bearer <HEALTH_TOKEN>``. Returns HTTP 404
-    (not 401) on bad credentials — avoids confirming the endpoint exists
-    to unauthenticated scanners.
-
-    Returns:
-        JSON health payload with HTTP 200, or HTTP 404 on auth failure.
-    """
     if not HEALTH_TOKEN or request.headers.get("Authorization") != f"Bearer {HEALTH_TOKEN}":
         abort(404)
 
@@ -1046,32 +805,33 @@ def health_check():
     if _cache_updated_at:
         age = round((datetime.now() - _cache_updated_at).total_seconds())
 
+    redis_ok = False
+    if _redis is not None:
+        try:
+            _redis.ping()
+            redis_ok = True
+        except Exception:
+            pass
+
     return jsonify({
         "status":          "healthy",
+        "redis_connected": redis_ok,
         "products_cached": len(_get_products()),
         "cache_age_secs":  age,
-        "active_sessions": len(_user_sessions),
         "timestamp":       datetime.now().isoformat(),
     }), 200
 
 
 @app.route("/", methods=["GET"])
 def index():
-    """Liveness probe for Render's default health check."""
-    return jsonify({"bot": "Ace Bot", "version": "Final Deployment"}), 200
+    return jsonify({"bot": "Ace Bot", "version": "Final Deployment — Redis"}), 200
 
 
 # ============================================================================
 # SECTION 7 — Startup
 # ============================================================================
 
-
 def _validate_env() -> None:
-    """Assert all required secrets are present and config is valid.
-
-    Raises:
-        EnvironmentError: On any missing critical secret or invalid URL pattern.
-    """
     required = {
         "PAGE_ACCESS_TOKEN":   PAGE_ACCESS_TOKEN,
         "FB_APP_SECRET":       FB_APP_SECRET,
@@ -1094,22 +854,35 @@ def _validate_env() -> None:
         "SENDER_EMAIL":    SENDER_EMAIL,
         "SENDER_PASSWORD": SENDER_PASSWORD,
         "RECEIVER_EMAIL":  RECEIVER_EMAIL,
+        "REDIS_URL":       REDIS_URL,
     }
     missing_opt = [k for k, v in optional.items() if not v]
     if missing_opt:
         logger.warning(
-            "Optional config missing (admin email / health check disabled): %s",
-            ", ".join(missing_opt),
+            "Optional config missing: %s", ", ".join(missing_opt),
         )
     logger.info("Environment validated.")
 
 
-def _startup() -> None:
-    """Initialise Gemini, the product cache, and the background refresh scheduler.
+def _init_redis() -> None:
+    """Connect to Redis. Sets module-level _redis on success, leaves it None on failure."""
+    global _redis
+    if not REDIS_URL:
+        logger.warning("REDIS_URL not set — using in-memory session storage (not persistent).")
+        return
+    try:
+        client = redis_lib.from_url(REDIS_URL, decode_responses=True, socket_timeout=5)
+        client.ping()
+        _redis = client
+        logger.info("Redis connected: %s", REDIS_URL.split("@")[-1])  # log host only, not password
+    except Exception as exc:
+        logger.error("Redis connection failed — falling back to in-memory: %s", exc)
 
-    Separated from ``_validate_env`` so unit tests can call the latter without
-    spinning up a real scheduler or making network calls.
-    """
+
+def _startup() -> None:
+    """Initialise Redis, Gemini, product cache, scheduler, and webhook worker."""
+    _init_redis()
+
     genai.configure(api_key=GEMINI_API_KEY)
     logger.info("Gemini configured (model: %s).", GEMINI_MODEL)
 
@@ -1121,62 +894,83 @@ def _startup() -> None:
     scheduler.start()
     logger.info("Scheduler started — cache refresh every %d min.", CACHE_REFRESH_MINS)
 
-    _refresh_cache()  # populate immediately on boot, don't wait 60 min
+    _refresh_cache()
+
+    global _event_pool
+    _event_pool = ThreadPoolExecutor(
+        max_workers=int(os.environ.get("WEBHOOK_WORKERS", "4")),
+        thread_name_prefix="webhook",
+    )
+
+    def _process_one(ev: dict) -> None:
+        psid = ev.get("sender", {}).get("id")
+        if not psid:
+            return
+
+        if "message" in ev:
+            msg = ev["message"]
+            if msg.get("is_echo"):
+                _handle_admin_echo(ev)
+                return
+            text = msg.get("text", "").strip()
+            mid  = msg.get("mid", "")
+            if not text or not mid:
+                return
+            if _is_duplicate(mid):
+                logger.info("Duplicate mid dropped: %s", mid)
+                return
+            if _is_paused(psid):
+                logger.info("Bot paused for %s — message ignored.", psid[:20])
+                return
+            _handle_message(psid, text)
+            return
+
+        if "postback" in ev:
+            postback    = ev.get("postback", {})
+            payload_str = postback.get("payload", "")
+            if not payload_str:
+                return
+            pb_mid = postback.get("mid")
+            if pb_mid:
+                if _is_duplicate(pb_mid):
+                    logger.info("Duplicate postback mid dropped: %s", pb_mid)
+                    return
+            else:
+                pb_key = "pb:" + hashlib.sha256(
+                    f"{psid}:{payload_str}".encode()
+                ).hexdigest()
+                if _is_duplicate(pb_key):
+                    logger.info("Duplicate postback dropped for %s.", psid[:20])
+                    return
+            _handle_postback(psid, payload_str)
 
     def _webhook_worker() -> None:
         while True:
             payload = _event_queue.get()
             try:
+                futures = []
                 for entry in payload.get("entry", []):
                     for event in entry.get("messaging", []):
-                        psid = event.get("sender", {}).get("id")
-                        if not psid:
-                            continue
-
-                        if "message" in event:
-                            msg = event["message"]
-
-                            # Echo = the Page sent this from Inbox. Must not re-enter the pipeline.
-                            if msg.get("is_echo"):
-                                _handle_admin_echo(event)
-                                continue
-
-                            text = msg.get("text", "").strip()
-                            mid  = msg.get("mid", "")
-
-                            if not text or not mid:
-                                continue
-                            if _is_duplicate(mid):
-                                logger.info("Duplicate mid dropped: %s", mid)
-                                continue
-                            if _is_paused(psid):
-                                logger.info("Bot paused for %s — message ignored.", psid[:20])
-                                continue
-
-                            _handle_message(psid, text)
-
-                        elif "postback" in event:
-                            postback = event.get("postback", {})
-                            payload_str = postback.get("payload", "")
-                            if not payload_str:
-                                continue
-
-                            # Postbacks don't always have message.mid; dedup them anyway.
-                            pb_mid = postback.get("mid")
-                            if pb_mid:
-                                if _is_duplicate(pb_mid):
-                                    logger.info("Duplicate postback mid dropped: %s", pb_mid)
-                                    continue
+                        try:
+                            if _event_pool is None:
+                                _process_one(event)
                             else:
-                                pb_key = (
-                                    "pb:"
-                                    + hashlib.sha256(f"{psid}:{payload_str}".encode("utf-8")).hexdigest()
-                                )
-                                if _is_duplicate(pb_key):
-                                    logger.info("Duplicate postback payload dropped for %s.", psid[:20])
-                                    continue
-
-                            _handle_postback(psid, payload_str)
+                                futures.append(_event_pool.submit(_process_one, event))
+                        except Exception:
+                            logger.exception("Failed to dispatch webhook event.")
+                if futures:
+                    timeout = int(os.environ.get("WEBHOOK_PAYLOAD_TIMEOUT_SECS", "25"))
+                    done, not_done = wait(futures, timeout=timeout)
+                    for fut in done:
+                        try:
+                            fut.result()
+                        except Exception:
+                            logger.exception("Webhook task failed.")
+                    if not_done:
+                        logger.warning(
+                            "%d webhook task(s) still running after %ds.",
+                            len(not_done), timeout,
+                        )
             except Exception:
                 logger.exception("Unhandled error processing webhook payload.")
             finally:
@@ -1186,7 +980,7 @@ def _startup() -> None:
     logger.info("Webhook worker started (queue max: %d).", _event_queue.maxsize)
 
 
-# Module-level startup — runs when Gunicorn imports this module (Render deployment).
+# Module-level startup — runs when Gunicorn imports this module.
 _validate_env()
 _startup()
 
