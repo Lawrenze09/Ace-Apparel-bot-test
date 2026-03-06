@@ -792,6 +792,7 @@ def webhook():
 
     try:
         _event_queue.put_nowait(data)
+        logger.info("Event queued. Queue size: %d", _event_queue.qsize())
     except Full:
         logger.error("Webhook queue full — dropping payload to protect uptime.")
     return "OK", 200
@@ -948,6 +949,7 @@ def _startup() -> None:
             _handle_postback(psid, payload_str)
 
     def _webhook_worker() -> None:
+        logger.info("Webhook worker thread is alive.")
         while True:
             payload = _event_queue.get()
             try:
@@ -991,5 +993,6 @@ _startup()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=False)
+
 
 
