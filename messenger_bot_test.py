@@ -34,7 +34,9 @@ from collections import deque
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from queue import Full, Queue
 from threading import Lock
+from threading import Thread
 from typing import Optional
 
 import google.generativeai as genai
@@ -191,6 +193,10 @@ _user_sessions: dict[str, dict] = {}
 # One lock protects both shared structures above.
 _state_lock = Lock()
 
+# Webhook processing queue. Prevents spawning unbounded threads when Meta retries
+# deliveries during cold starts or transient slowdowns.
+_event_queue: "Queue[dict]" = Queue(maxsize=int(os.environ.get("WEBHOOK_QUEUE_MAX", "200")))
+
 
 def _is_duplicate(mid: str) -> bool:
     """Return True if this message ID has already been processed.
@@ -245,6 +251,16 @@ def _is_first_time(psid: str) -> bool:
             return False
         session["greeted"] = True
         return True
+
+
+def _mark_greeted(psid: str) -> None:
+    """Mark a user as greeted without sending the greeting.
+
+    Used when a first-ever message triggers a non-greeting terminal path
+    (e.g., admin handover) so the user doesn't get a welcome message later.
+    """
+    with _state_lock:
+        _get_session(psid)["greeted"] = True
 
 
 def _is_paused(psid: str) -> bool:
@@ -680,6 +696,11 @@ def _notify_admin(psid: str, message: str, profile: dict) -> bool:
     Returns:
         ``True`` if the email was sent.
     """
+    if not (SENDER_EMAIL and SENDER_PASSWORD and RECEIVER_EMAIL):
+        logger.warning(
+            "Admin email not configured (missing SENDER_EMAIL/SENDER_PASSWORD/RECEIVER_EMAIL)."
+        )
+        return False
     if not _allow_email(psid):
         logger.warning("Email rate-limited for %s — suppressed.", psid[:20])
         return False
@@ -762,19 +783,20 @@ def _handle_message(psid: str, raw_text: str) -> None:
         # Normalise once here — all rule checks below use this.
         text = raw_text[:MAX_INPUT_CHARS].strip().lower()
 
-        # ── Step 1: First-time greeting + default carousel ───────────────────
-        if _is_first_time(psid):
-            _send_first_time_greeting(psid)
-            return
-
-        # ── Step 2: Admin handover ────────────────────────────────────────────
+        # ── Step 1: Admin handover (must work even on a first-ever message) ──
         if any(kw in text for kw in HANDOVER_KEYWORDS):
             send_text(psid, (
                 "We are really sorry for the inconvenience po.\n"
                 "I-a-alert ko na po si admin para matulungan po kayo agad."
             ))
+            _mark_greeted(psid)
             _notify_admin(psid, raw_text, profile)
             _set_paused(psid, True)
+            return
+
+        # ── Step 2: First-time greeting + default carousel ───────────────────
+        if _is_first_time(psid):
+            _send_first_time_greeting(psid)
             return
 
         # ── Step 3: Explicit catalog browse trigger ───────────────────────────
@@ -992,39 +1014,17 @@ def webhook():
     if data.get("object") != "page":
         return "OK", 200
 
-    for entry in data.get("entry", []):
-        for event in entry.get("messaging", []):
-            psid = event.get("sender", {}).get("id")
-            if not psid:
-                continue
-
-            if "message" in event:
-                msg = event["message"]
-
-                # Echo = the Page sent this from Inbox. Must not re-enter the pipeline.
-                if msg.get("is_echo"):
-                    _handle_admin_echo(event)
-                    continue
-
-                text = msg.get("text", "").strip()
-                mid  = msg.get("mid", "")
-
-                if not text or not mid:
-                    continue
-                if _is_duplicate(mid):
-                    logger.info("Duplicate mid dropped: %s", mid)
-                    continue
-                if _is_paused(psid):
-                    logger.info("Bot paused for %s — message ignored.", psid[:20])
-                    continue
-
-                _handle_message(psid, text)
-
-            elif "postback" in event:
-                payload = event["postback"].get("payload", "")
-                if payload:
-                    _handle_postback(psid, payload)
-
+    # IMPORTANT (Render cold starts):
+    # Return HTTP 200 to Meta as fast as possible. If we block here on network
+    # calls (Graph API, SMTP, Gemini), Meta retries delivery and you see
+    # duplicate greetings / repeated actions.
+    #
+    # We enqueue the payload for a single background worker instead of spawning
+    # a thread per request (which can spike memory and get the worker SIGKILL'ed).
+    try:
+        _event_queue.put_nowait(data)
+    except Full:
+        logger.error("Webhook queue full — dropping payload to protect uptime.")
     return "OK", 200
 
 
@@ -1122,6 +1122,68 @@ def _startup() -> None:
     logger.info("Scheduler started — cache refresh every %d min.", CACHE_REFRESH_MINS)
 
     _refresh_cache()  # populate immediately on boot, don't wait 60 min
+
+    def _webhook_worker() -> None:
+        while True:
+            payload = _event_queue.get()
+            try:
+                for entry in payload.get("entry", []):
+                    for event in entry.get("messaging", []):
+                        psid = event.get("sender", {}).get("id")
+                        if not psid:
+                            continue
+
+                        if "message" in event:
+                            msg = event["message"]
+
+                            # Echo = the Page sent this from Inbox. Must not re-enter the pipeline.
+                            if msg.get("is_echo"):
+                                _handle_admin_echo(event)
+                                continue
+
+                            text = msg.get("text", "").strip()
+                            mid  = msg.get("mid", "")
+
+                            if not text or not mid:
+                                continue
+                            if _is_duplicate(mid):
+                                logger.info("Duplicate mid dropped: %s", mid)
+                                continue
+                            if _is_paused(psid):
+                                logger.info("Bot paused for %s — message ignored.", psid[:20])
+                                continue
+
+                            _handle_message(psid, text)
+
+                        elif "postback" in event:
+                            postback = event.get("postback", {})
+                            payload_str = postback.get("payload", "")
+                            if not payload_str:
+                                continue
+
+                            # Postbacks don't always have message.mid; dedup them anyway.
+                            pb_mid = postback.get("mid")
+                            if pb_mid:
+                                if _is_duplicate(pb_mid):
+                                    logger.info("Duplicate postback mid dropped: %s", pb_mid)
+                                    continue
+                            else:
+                                pb_key = (
+                                    "pb:"
+                                    + hashlib.sha256(f"{psid}:{payload_str}".encode("utf-8")).hexdigest()
+                                )
+                                if _is_duplicate(pb_key):
+                                    logger.info("Duplicate postback payload dropped for %s.", psid[:20])
+                                    continue
+
+                            _handle_postback(psid, payload_str)
+            except Exception:
+                logger.exception("Unhandled error processing webhook payload.")
+            finally:
+                _event_queue.task_done()
+
+    Thread(target=_webhook_worker, daemon=True).start()
+    logger.info("Webhook worker started (queue max: %d).", _event_queue.maxsize)
 
 
 # Module-level startup — runs when Gunicorn imports this module (Render deployment).
