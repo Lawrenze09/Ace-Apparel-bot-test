@@ -51,7 +51,7 @@ graph TD
     H -->|Paused| I[Message Ignored\nAdmin has thread]
     H -->|Active| J{Hybrid Routing Engine}
 
-    J -->|Escalation keyword?| K[SMTP Alert + Bot Pause\n_notify_admin]
+    J -->|Escalation keyword?| K[SMTP Alert\n_notify_admin]
     J -->|First contact?| L[_send_first_time_greeting\nName + Default Carousel]
     J -->|Browse intent?| M[_build_default_carousel\nCategory-Filtered JSON]
     J -->|Greeting keyword?| N[Intercept — Short Reply\n_GREETING_KEYWORDS set]
@@ -83,43 +83,60 @@ This project was built using a **multi-model AI orchestration workflow** — a d
 |:---|:---|:---|
 | System architecture design | **Claude Opus** | Long-context reasoning for multi-component dependency analysis |
 | Core engine development | **Gemini 2.5 Flash Lite** | Rapid iteration on routing logic and prompt tuning |
-| Gunicorn deployment debugging | **Claude Opus** | Root-cause analysis of worker process isolation behavior |
+| Gunicorn fork isolation debugging | **Claude Opus** | Root-cause analysis of daemon thread death after worker fork |
 | HMAC security implementation | **Claude Opus** | Formal verification reasoning for timing-oracle threat model |
 | Prompt engineering (Sofia persona) | **Gemini 2.5 Flash Lite** | In-domain testing of Taglish response quality |
 | Code review and dedup logic | **Claude Opus** | Systematic audit for race conditions in concurrent sessions |
 | Redis session architecture | **Claude Opus** | Persistence strategy across Render restart/rebuild cycles |
 | IDE Integration | **Cursor** | AI-native code navigation and inline refactoring |
 
-### Key Resolution: Gunicorn Worker Synchronization
+### Key Resolution: Gunicorn Worker Thread Isolation
 
-The most significant deployment issue encountered was a **silent cache starvation bug** on Render. The product cache was consistently returning empty on production despite successful local tests.
+The most significant deployment issue encountered was a **silent message processing failure** on Render. The bot received webhooks (returning 200), Redis connected, the product cache loaded — but Sofia never replied to any message. No errors appeared in logs.
 
 **Root Cause (identified via AI-augmented debugging):**
-Flask's conventional `if __name__ == "__main__"` startup guard is never executed by Gunicorn — Gunicorn imports the module directly. All initialization logic inside that guard (`_validate_env()`, `_startup()`, `_refresh_cache()`) was silently skipped. The bot started with an empty cache and never recovered within the first request window.
+Gunicorn forks a child worker process after the master process imports the module. Daemon threads started before the fork — including the `_webhook_worker` thread and its `Queue` — exist only in the master process. The forked child process receives its own empty copy of the `Queue` with no consumer thread. Events were being enqueued in the child but nothing ever dequeued them.
 
-**Resolution:**
+```
+Master process (PID 40):  _startup() called → Queue + Thread created ✓
+                              │
+                              └── Gunicorn fork()
+                                      │
+Child process (PID 61):   Queue is an empty copy. Thread is dead.
+                           Events enqueue → nothing consumes them → silent drop.
+```
+
+**Resolution:** A `gunicorn.conf.py` file with a `post_fork` hook was added. This ensures `_startup()` runs inside the child process after the fork, creating a live Queue and worker thread in the correct process:
+
 ```python
-# BEFORE — Gunicorn never executes this block
-if __name__ == "__main__":
-    _validate_env()
-    _startup()          # _refresh_cache() called here — NEVER RUNS under Gunicorn
-    app.run(...)
+# gunicorn.conf.py
+def post_fork(server, worker):
+    """Start the webhook worker thread AFTER Gunicorn forks the worker process."""
+    from messenger_bot_test import _startup
+    _startup()
+```
 
-# AFTER — Module-level triggers, executed on import by any WSGI server
+```python
+# messenger_bot_test.py — module level
 _validate_env()
-_startup()              # Cache populated before first request arrives
+# _startup() is called by gunicorn post_fork hook in gunicorn.conf.py
 
 if __name__ == "__main__":
+    _startup()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=False)
 ```
 
-**Confirmed in production logs:**
+```bash
+# Start command updated to load the config
+gunicorn --workers 1 --threads 4 --config gunicorn.conf.py messenger_bot_test:app
 ```
-Redis connected: ap-southeast-1.upstash.io:PORT
-Environment validated.
-Gemini configured (model: gemini-2.5-flash-lite).
-Scheduler started — cache refresh every 60 min.
-Cache refreshed — 60 products loaded.
+
+**Confirmed in production logs after fix:**
+```
+Webhook worker thread is alive.
+Event queued. Queue size: 1
+Payload entry count: 1
+Entry keys: ['time', 'id', 'messaging'] | messaging count: 1
 ```
 
 <br>
@@ -246,7 +263,16 @@ def _allow_email(psid: str) -> bool:
     return True
 ```
 
-Rate-limit timestamps are stored inside the Redis session so they persist correctly across restarts. On trigger: customer receives a Taglish apology, admin receives a structured alert (name, PSID, message, timestamp), and the bot sets `paused=True` for that thread. Admin resumes by typing `bot` or `sofia` in the Page inbox.
+Rate-limit timestamps are stored inside the Redis session so they persist correctly across restarts. On trigger: customer receives a Taglish apology and admin receives a structured alert (name, PSID, message, timestamp).
+
+> **Note on free-tier SMTP:** Render's free tier blocks outbound SMTP connections (port 587). Email alerts function correctly on paid Render instances or when using an HTTP-based email provider (SendGrid, Resend). The bot continues to handle handover routing correctly regardless of email delivery status.
+
+**Admin Pause/Resume Flow:**
+- Customer triggers escalation keyword → bot sends apology, continues responding
+- Admin replies in **Facebook Page Inbox** → echo event sets `paused=True` for that thread
+- Admin types `bot` or `sofia` in Page Inbox → bot resumes, customer notified
+
+> **Webhook requirement:** `message_echoes` must be enabled in both the **Configure Webhooks** and **Generate Access Tokens** webhook subscription fields in Meta Developer settings for admin echo detection to function.
 
 <br>
 
@@ -259,8 +285,8 @@ Rate-limit timestamps are stored inside the Redis session so they persist correc
 | **Dynamic Carousel Rendering** | Runtime JSON assembly, defensive price parsing, `_stock_label()` mapping | Accurate product cards with live stock status on every query |
 | **Hybrid Logic Routing** | 6-step deterministic pipeline before probabilistic fallback | Zero price hallucination, sub-2s response on rule matches |
 | **Redis Session Persistence** | Per-PSID state stored in Upstash Redis, 90-day TTL, in-memory fallback | Sessions survive Render restarts — no spam greetings on wake |
-| **SMTP Escalation** | Sliding-window rate limiter, smtplib STARTTLS, bot auto-pause | Admin notified only for real escalations, never spammed |
-| **Production Bootstrapping** | Module-level `_validate_env()` + `_startup()` triggers | Cache populated at Gunicorn import — zero cold-start latency |
+| **SMTP Escalation** | Sliding-window rate limiter, smtplib STARTTLS, admin echo pause | Admin notified for real escalations, bot pauses when admin takes over |
+| **Production Bootstrapping** | `post_fork` hook in `gunicorn.conf.py` triggers `_startup()` in child process | Queue and worker thread alive in correct process — zero silent drops |
 | **Webhook Security** | HMAC-SHA256 + `hmac.compare_digest` + 1MB body cap | Forged payloads rejected before application code runs |
 | **Message Deduplication** | Redis SETNX with 5-min TTL (deque fallback for local dev) | Facebook retry floods silently dropped — no double-replies |
 | **SSRF Prevention** | Regex pattern validation on `GITHUB_PRODUCTS_URL` at boot | Internal network requests blocked if env var is misconfigured |
@@ -278,13 +304,13 @@ Rate-limit timestamps are stored inside the Redis session so they persist correc
 | **Messenger API** | Meta Graph API v22 | Message delivery, Generic Templates, postbacks |
 | **Session & Dedup** | Redis (Upstash) | Persistent session state + atomic deduplication |
 | **Product Data** | GitHub-hosted JSON | Live catalog with 60-min auto-refresh via APScheduler |
-| **Email** | smtplib + Gmail SMTP + STARTTLS | Rate-limited admin escalation alerts |
+| **Email** | smtplib + Gmail SMTP + STARTTLS | Rate-limited admin escalation alerts (requires paid Render tier) |
 | **Security** | HMAC-SHA256 + `hmac.compare_digest` | Signed webhook verification |
 | **Secrets** | Render Secret Files (`/etc/secrets/`) | Zero-exposure credential storage |
 | **IDE / Tooling** | Cursor + Claude Opus + GitHub | AI-augmented development and architectural review |
 | **Deployment** | Render (CI/CD on `git push main`) | Auto-deploy production hosting |
 | **Local Dev** | ngrok + python-dotenv | HTTPS tunnel and local environment isolation |
-| **Process Manager** | Gunicorn (`--workers 1 --threads 4`) | Single-worker threading with Redis-backed shared state |
+| **Process Manager** | Gunicorn (`--workers 1 --threads 4 --config gunicorn.conf.py`) | post_fork hook ensures worker thread starts in child process |
 
 <br>
 
@@ -297,9 +323,10 @@ Hybrid-AI-Messenger-Bot/
 ├── messenger_bot_test.py   # Core middleware — 7 sections, fully documented
 │                           # Sections: Security · Memory/Redis · Data · API Handlers
 │                           #           Routing Engine · Flask Routes · Startup
+├── gunicorn.conf.py        # post_fork hook — starts _startup() in Gunicorn child process
 ├── products.json           # Live product catalog — edit to update Sofia instantly
 ├── requirements.txt        # Pinned dependencies (includes redis>=5.0,<6.0)
-├── Procfile                # gunicorn --workers 1 --threads 4 messenger_bot_test:app
+├── Procfile                # gunicorn --workers 1 --threads 4 --config gunicorn.conf.py messenger_bot_test:app
 ├── runtime.txt             # python-3.11.9
 ├── privacy.html            # Meta platform policy compliance
 ├── .gitignore              # .env and secret files excluded
@@ -312,18 +339,7 @@ Hybrid-AI-Messenger-Bot/
 
 ## Engineering Challenges
 
-### Challenge 1 — Silent Cache Starvation on Render
-**Symptom:** Bot deployed successfully. All environment variables confirmed present. Product cache consistently empty on first request. Keywords returned zero matches. Cache log line never appeared.
-
-**Diagnosis process:** Confirmed locally via ngrok — cache loaded correctly. Isolated to deployment environment. Identified that Gunicorn worker import behavior bypasses `if __name__ == "__main__"`. Verified with Claude Opus via architectural trace of Python module import vs direct execution.
-
-**Resolution:** Moved `_validate_env()` and `_startup()` to module level. Cache now loads during Gunicorn's worker initialization phase — before any HTTP request is processed.
-
-**Time to resolution with AI-augmented debugging:** ~10 minutes from symptom to confirmed fix in Render logs.
-
----
-
-### Challenge 2 — Double-Greeting Across Entry Paths
+### Challenge 1 — Double-Greeting Across Entry Paths
 **Symptom:** Users who clicked the Get Started button and then typed "hi" received two greetings. Sofia's Gemini fallback was generating its own introduction despite the bot already having welcomed the user.
 
 **Diagnosis process:** Traced all entry paths. Confirmed `greeted=True` was being set correctly by the Get Started postback handler. Identified that "hi" was falling through the rule pipeline to Gemini, which has no awareness of session state.
@@ -334,7 +350,7 @@ Hybrid-AI-Messenger-Bot/
 
 ---
 
-### Challenge 3 — Wrong Availability Labels for 24 Products
+### Challenge 2 — Wrong Availability Labels for 24 Products
 **Symptom:** Carousel cards displayed "Out of Stock" for Limited Edition and Low Stock products. 24 of 60 products showed incorrect status.
 
 **Root Cause:** Original code handled only two states (`"In Stock"` / else `"Out of Stock"`). The JSON schema defined four: `"In Stock"`, `"Limited Edition"`, `"Low Stock"`, `"Out of Stock"`. The mismatch was silent — no errors raised, wrong labels rendered.
@@ -353,7 +369,7 @@ def _stock_label(availability: str) -> str:
 
 ---
 
-### Challenge 4 — Session Loss on Render Sleep / Restart
+### Challenge 3 — Session Loss on Render Sleep / Restart
 **Symptom:** After ~15 minutes of inactivity, Render spins down the free-tier service. On wake, all in-memory state (`_user_sessions`, `_seen_message_ids`) was wiped. Facebook queued retries arrived simultaneously, each hitting `_is_first_time()` with `greeted=False`, sending 3–4 welcome messages to the same user.
 
 **Root Cause:** In-memory Python dicts don't survive process termination. Free-tier Render instances restart on any new request after idle timeout. No external state store meant every restart was a clean slate.
@@ -371,6 +387,27 @@ return added is None  # None = key existed = duplicate
 
 Sessions now survive restarts, rebuilds, and idle spin-downs completely.
 
+---
+
+### Challenge 4 — Silent Message Processing Failure on Render
+**Symptom:** Bot fully deployed. Redis connected. Cache loaded with 60 products. Webhooks returning 200. But Sofia never replied to any message. No errors in logs whatsoever.
+
+**Diagnosis process:** Added incremental debug logging — confirmed events were enqueuing correctly but `_process_one` was never called. The Queue was being populated in one process but consumed nowhere. Narrowed the failure to Gunicorn's `fork()` behavior via systematic log instrumentation and architectural analysis.
+
+**Root Cause:** Gunicorn forks child worker processes after importing the module. Daemon threads (including `_webhook_worker`) and their associated `Queue` objects exist only in the master process. The forked child receives its own empty copy of the Queue with no consumer thread. Events enqueue in the child and are never processed — silently.
+
+**Resolution:** Added `gunicorn.conf.py` with a `post_fork` hook:
+
+```python
+def post_fork(server, worker):
+    from messenger_bot_test import _startup
+    _startup()
+```
+
+Updated Render start command to `gunicorn --workers 1 --threads 4 --config gunicorn.conf.py messenger_bot_test:app`. Worker thread now starts inside the correct child process after every fork.
+
+**Time to resolution with AI-augmented debugging:** Identified through systematic log instrumentation — each debug log narrowing the failure point until the fork isolation root cause was confirmed.
+
 <br>
 
 ---
@@ -378,7 +415,7 @@ Sessions now survive restarts, rebuilds, and idle spin-downs completely.
 ## Local Development
 
 ```bash
-git clone https://github.com/Lawrenzie09/Hybrid-AI-Messenger-Bot.git
+git clone https://github.com/Lawrenze09/Hybrid-AI-Messenger-Bot.git
 cd Hybrid-AI-Messenger-Bot
 
 python -m venv .venv
@@ -395,7 +432,7 @@ PAGE_ACCESS_TOKEN=your_value
 FB_APP_SECRET=your_value
 VERIFY_TOKEN=your_value
 GEMINI_API_KEY=your_value
-GITHUB_PRODUCTS_URL=https://raw.githubusercontent.com/Lawrenzie09/Hybrid-AI-Messenger-Bot/main/products.json
+GITHUB_PRODUCTS_URL=https://raw.githubusercontent.com/Lawrenze09/Hybrid-AI-Messenger-Bot/main/products.json
 SENDER_EMAIL=your_gmail@gmail.com
 SENDER_PASSWORD=your_16char_app_password
 RECEIVER_EMAIL=admin@example.com
@@ -431,8 +468,11 @@ ngrok http 5000
 3. Add `FB_APP_SECRET` and `PAGE_ACCESS_TOKEN` as **Secret Files** at `/etc/secrets/`
 4. Confirm `Procfile`:
    ```
-   web: gunicorn --workers 1 --threads 4 messenger_bot_test:app
+   web: gunicorn --workers 1 --threads 4 --config gunicorn.conf.py messenger_bot_test:app
    ```
+5. In Meta Developer → Messenger API Settings → Webhook subscriptions, enable **`message_echoes`** under both **Configure Webhooks** and **Generate Access Tokens** sections. This is required for admin echo detection (bot pause/resume from Page Inbox).
+
+> **Note on Page Access Token:** Always generate the token from **Messenger API Settings → Access Tokens → Generate** next to your Page — not from Graph API Explorer. The correct token returns your Page name when tested at `https://graph.facebook.com/v22.0/me?access_token=YOUR_TOKEN`.
 
 **Note on `--workers 1`:** Multiple Gunicorn workers create separate Python processes. The in-memory product cache (`_products_cache`) and APScheduler instance are not shared across workers — running multiple workers would cause each to maintain its own independent cache refresh cycle. Session state is handled by Redis and is cross-worker safe, but the cache layer keeps this deployment at single-worker for simplicity.
 
@@ -450,11 +490,12 @@ ngrok http 5000
 | 4 | SKU direct lookup | `ACE-OVT-001` | Single card + price + description |
 | 5 | Keyword search | `mesh shorts` | Multi-product carousel |
 | 6 | Price filter | `hoodie below 1200` | Filtered carousel |
-| 7 | Admin handover | `refund` | Taglish apology + SMTP alert + bot pauses |
-| 8 | Bot resume | Admin types `bot` | Sofia resumes, customer notified |
-| 9 | AI fallback | `ano po sizing niyo?` | Gemini Taglish reply |
-| 10 | Security — unsigned request | Forged POST | `403 Forbidden` |
-| 11 | Session persistence | Restart Render service, message again | No repeat greeting — Redis session intact |
+| 7 | Admin handover | `refund` | Taglish apology + SMTP alert (paid tier) |
+| 8 | Bot pause | Admin replies in Page Inbox | Bot silent for that user |
+| 9 | Bot resume | Admin types `bot` in Page Inbox | Sofia resumes, customer notified |
+| 10 | AI fallback | `ano po sizing niyo?` | Gemini Taglish reply |
+| 11 | Security — unsigned request | Forged POST | `403 Forbidden` |
+| 12 | Session persistence | Restart Render service, message again | No repeat greeting — Redis session intact |
 
 <br>
 
