@@ -623,6 +623,8 @@ def _handle_message(psid: str, raw_text: str) -> None:
         text       = raw_text[:MAX_INPUT_CHARS].strip().lower()
 
         # ── Step 1: Admin handover ────────────────────────────────────────────
+        # Bot does NOT auto-pause here. It alerts admin via email and keeps
+        # responding. Admin pauses the bot by typing any message in Page Inbox.
         if any(kw in text for kw in HANDOVER_KEYWORDS):
             send_text(psid, (
                 "We are really sorry for the inconvenience po.\n"
@@ -630,7 +632,6 @@ def _handle_message(psid: str, raw_text: str) -> None:
             ))
             _mark_greeted(psid)
             _notify_admin(psid, raw_text, profile)
-            _set_paused(psid, True)
             return
 
         # ── Step 2: First-time greeting ───────────────────────────────────────
