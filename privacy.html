@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -29,7 +30,7 @@
 <body>
 
     <h1>Privacy Policy</h1>
-    <p class="last-updated">Last updated: March 5, 2026</p>
+    <p class="last-updated">Last updated: March 6, 2026</p>
 
     <p>
         This Privacy Policy explains how <strong>Nazh Lawrenze Romero</strong> ("I", "my") collects,
@@ -52,10 +53,10 @@
         </li>
         <li>
             <strong>Page-Scoped User ID (PSID)</strong> — a Facebook-assigned identifier
-            unique to your interaction with my Page. Held in server memory during the
-            session to manage conversation state (e.g. whether an admin has taken over
-            the chat). This is cleared when the server restarts and is never written to
-            persistent storage.
+            unique to your interaction with my Page. Stored in a Redis database (Upstash)
+            to manage conversation state (e.g. whether you have been welcomed, whether an
+            admin has taken over the chat). Session records expire automatically after
+            90 days of inactivity.
         </li>
         <li>
             <strong>Message Content</strong> — the text of your messages is processed
@@ -63,6 +64,11 @@
             keyword (such as a refund or complaint request), the message text, your name,
             and your PSID are included in an email alert sent to me as the admin.
             That email is retained in my inbox until manually deleted.
+        </li>
+        <li>
+            <strong>Message IDs</strong> — unique identifiers assigned by Facebook to each
+            message are stored in Redis for up to 5 minutes to prevent duplicate processing
+            of retried deliveries. They are automatically deleted after this window.
         </li>
     </ul>
 
@@ -74,7 +80,12 @@
             admin for follow-up via Facebook Page Inbox.
         </li>
         <li>
-            To prevent abuse — message IDs are kept in memory for up to one hour to
+            To maintain conversation state (e.g. whether you have already been welcomed,
+            whether an admin currently has the thread) across sessions using a persistent
+            Redis database.
+        </li>
+        <li>
+            To prevent abuse — message IDs are stored in Redis for up to 5 minutes to
             avoid processing duplicate deliveries from Facebook's servers.
         </li>
     </ul>
@@ -102,6 +113,14 @@
             described in Section 1.
         </li>
         <li>
+            <strong>Upstash (Redis)</strong> — session state (your PSID and conversation
+            flags) and message deduplication IDs are stored in a Redis database hosted by
+            Upstash. Session data is retained for up to 90 days of inactivity and then
+            automatically deleted. Message IDs are retained for up to 5 minutes. See
+            <a href="https://upstash.com/trust/privacy.pdf" target="_blank" rel="noopener">
+            Upstash's Privacy Policy</a>.
+        </li>
+        <li>
             <strong>Render</strong> — this bot is hosted on Render's cloud platform.
             Server logs may contain request metadata such as IP addresses and timestamps.
             See <a href="https://render.com/privacy" target="_blank" rel="noopener">
@@ -112,9 +131,14 @@
     <h2>4. Data Retention</h2>
     <ul>
         <li>
-            <strong>In-memory session data</strong> (PSID, conversation state, rate-limit
-            counters) — cleared automatically when the server restarts. Never written to
-            any persistent database or file.
+            <strong>Session data</strong> (PSID, conversation state, rate-limit counters)
+            — stored in a Redis database (Upstash) and automatically deleted after 90 days
+            of inactivity. Each time you interact with the bot, the 90-day expiry clock
+            resets.
+        </li>
+        <li>
+            <strong>Message deduplication IDs</strong> — stored in Redis for up to 5
+            minutes, then automatically deleted.
         </li>
         <li>
             <strong>Admin email alerts</strong> — retained in my Gmail inbox until I
@@ -131,9 +155,11 @@
     <h2>5. Data Deletion</h2>
     <p>
         To remove your conversation history with the bot, you can delete the thread
-        directly within the Facebook Messenger app. To request deletion of any admin
-        alert email that contains your personal information, contact me at
-        <strong>nlawrenzer@gmail.com</strong> and I will delete it within 7 days.
+        directly within the Facebook Messenger app. To request deletion of your session
+        data stored in Redis or any admin alert email containing your personal information,
+        contact me at <strong>nlawrenzer@gmail.com</strong> and I will delete it within
+        7 days. Note that session data also expires automatically after 90 days of
+        inactivity without any action required on your part.
     </p>
 
     <h2>6. Children's Privacy</h2>
