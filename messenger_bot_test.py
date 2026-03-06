@@ -952,7 +952,9 @@ def _startup() -> None:
             payload = _event_queue.get()
             try:
                 futures = []
+                logger.info("Payload entry count: %d", len(payload.get("entry", [])))  # ADD
                 for entry in payload.get("entry", []):
+                    logger.info("Entry keys: %s | messaging count: %d", list(entry.keys()), len(entry.get("messaging", [])))  # ADD
                     for event in entry.get("messaging", []):
                         try:
                             if _event_pool is None:
@@ -989,4 +991,5 @@ _startup()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=False)
+
 
