@@ -792,7 +792,6 @@ def webhook():
 
     try:
         _event_queue.put_nowait(data)
-        logger.info("Event queued. Queue size: %d", _event_queue.qsize())
     except Full:
         logger.error("Webhook queue full — dropping payload to protect uptime.")
     return "OK", 200
@@ -905,10 +904,8 @@ def _startup() -> None:
     )
 
     def _process_one(ev: dict) -> None:
-        logger.info("Event keys: %s", list(ev.keys()))
         psid = ev.get("sender", {}).get("id")
         if not psid:
-            logger.info("No PSID found in event — skipping.")
             return
 
         if "message" in ev:
@@ -954,9 +951,7 @@ def _startup() -> None:
             payload = _event_queue.get()
             try:
                 futures = []
-                logger.info("Payload entry count: %d", len(payload.get("entry", [])))  # ADD
                 for entry in payload.get("entry", []):
-                    logger.info("Entry keys: %s | messaging count: %d", list(entry.keys()), len(entry.get("messaging", [])))  # ADD
                     for event in entry.get("messaging", []):
                         try:
                             if _event_pool is None:
@@ -993,6 +988,7 @@ _validate_env()
 if __name__ == "__main__":
     _startup()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=False)
+
 
 
 
